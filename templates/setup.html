@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <title>Wi-Fi Setup</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+  <div class="panel">
+    <h1>Wi-Fi Setup</h1>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div style="margin-bottom: 12px;">
+          {% for category, message in messages %}
+            <div style="padding:10px; border-radius:10px; margin:6px 0; background: rgba(255,255,255,0.08);">
+              {{ message }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" action="/setup">
+      <label for="ssid">Network</label><br>
+      <select name="ssid" id="ssid" required>
+        <option value="" disabled selected>Select Wi-Fi…</option>
+        {% for n in networks %}
+          <option value="{{ n.ssid }}">{{ n.ssid }} ({{ n.signal }}%) {{ n.security }}</option>
+        {% endfor %}
+      </select>
+
+      <br><br>
+
+      <label for="password">Password (leave blank for open Wi-Fi)</label><br>
+      <input type="password" name="password" id="password" autocomplete="new-password" />
+
+      <br><br>
+
+      <button type="submit">Connect</button>
+    </form>
+
+    <p style="opacity:0.8; margin-top:16px;">
+      After connecting, open <b>http://transmogrifier.local</b> on your home Wi-Fi.
+      If anything goes wrong, reconnect to the <b>transmogrifier</b> hotspot and try again.
+    </p>
+  </div>
+</body>
+</html>

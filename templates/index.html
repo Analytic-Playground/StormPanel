@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <title>Good Night</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+
+  <video autoplay loop muted playsinline id="bg-video">
+    <source id="bg-source" src="{{ url_for('static', filename='videos/storm-1080.mp4') }}" type="video/mp4">
+  </video>
+
+  <div class="panel">
+    <h1>Miss Shushy</h1>
+
+    <div class="controls">
+      <h3>Background</h3>
+      <select id="bgSelect" class="control-select">
+        <option value="storm-1080.mp4">🌩 Storm</option>
+        <option value="ocean-1080-loop.mp4">🌊 Ocean</option>
+        <option value="fog_1080p_30fps.mp4">🌫 Fog</option>
+        <option value="forest_1080p_24fps.mp4">🌲 Forest</option>
+      </select>
+    </div>
+
+    <hr>
+
+    <div class="controls">
+      <h3>Now Playing</h3>
+
+      <select id="nowSelect" class="control-select">
+        <option value="" selected>Select a track…</option>
+        {% for track in tracks %}
+          <option value="{{ track }}">{{ track.replace('_',' ').replace('-',' ') }}</option>
+        {% endfor %}
+      </select>
+
+      <div style="display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+        <button id="playBtn" type="button" onclick="playSelected()" disabled>Play</button>
+        <button id="pauseBtn" type="button" onclick="pause()" disabled>Pause</button>
+        <button id="stopBtn" type="button" onclick="stop()" disabled>Stop</button>
+      </div>
+
+      <div id="statusLine" style="margin-top:10px; font-size: 13px; opacity: 0.85;"></div>
+    </div>
+
+    <hr>
+
+    <div class="controls">
+      <h3>Audio</h3>
+
+      <label for="volumeSlider">
+        Volume: <span id="volumeLabel">70%</span>
+      </label>
+
+      <input
+        id="volumeSlider"
+        type="range"
+        min="0"
+        max="100"
+        step="2"
+        value="70"
+      >
+    </div>
+
+    <hr>
+
+    <div class="controls">
+      <h3>Sleep Timer</h3>
+
+      <select id="timerSelect" class="control-select">
+        <option value="0" selected>Off</option>
+        <option value="30">30 minutes</option>
+        <option value="60">1 hour</option>
+        <option value="240">4 hours</option>
+        <option value="480">8 hours</option>
+      </select>
+
+      <div id="timerStatus" style="margin-top:10px;"></div>
+    </div>
+
+    <script>
+      // =========================
+      // Config
+      // =========================
+      const FADE_IN_SECONDS = 10;
+      const FADE_OUT_SECONDS = 90;
+      const DEFAULT_BG = 'storm-1080.mp4';
+
+      // =========================
+      // Helpers
+      // =========================
+      function setStatus(msg) {
+        const el = document.getElementById('statusLine');
+        if (el) el.textContent = msg || '';
+      }
+
+      async function postJson(url, payload) {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload ?? {})
+        });
+
+        const text = await res.text();
+        if (!res.ok) throw new Error(text || `${res.status} ${res.statusText}`);
+
+        // If server returns JSON, parse it; otherwise ignore
+        try { return JSON.parse(text); } catch { return {}; }
+      }
+
+      async function postNoBody(url) {
+        const res = await fetch(url, { method: 'POST' });
+        const text = await res.text();
+        if (!res.ok) throw new Error(text || `${res.status} ${res.statusText}`);
+        return text;
+      }
+
+      // =========================
+      // Background video
+      // =========================
+      function setBg(filename) {
+        const video = document.getElementById('bg-video');
+        const source = document.getElementById('bg-source');
+
+        source.src = `/static/videos/${filename}`;
+        video.load();
+        video.play();
+
+        localStorage.setItem('bgVideo', filename);
+      }
+
+      function initBackground() {
+        const bgSel = document.getElementById('bgSelect');
+        const savedBg = localStorage.getItem('bgVideo') || DEFAULT_BG;
+
+        if (bgSel) {
+          bgSel.value = savedBg;
+          bgSel.addEventListener('change', () => setBg(bgSel.value));
+        }
+        setBg(savedBg);
+      }
+
+      // =========================
+      // Playback
+      // =========================
+      function setButtons({ canPlay, canPauseStop }) {
+        document.getElementById('playBtn').disabled = !canPlay;
+        document.getElementById('pauseBtn').disabled = !canPauseStop;
+        document.getElementById('stopBtn').disabled  = !canPauseStop;
+      }
+
+      function getSelectedTrack() {
+        const sel = document.getElementById('nowSelect');
+        return sel ? sel.value : '';
+      }
+
+      function playSelected() {
+        const track = getSelectedTrack();
+        if (!track) return;
+        play(track);
+      }
+
+      async function play(track) {
+        try {
+          setStatus(`Loading: ${track.replaceAll('_',' ').replaceAll('-',' ')}`);
+          await postJson('/play', { track, fade_in_seconds: FADE_IN_SECONDS });
+          setButtons({ canPlay: true, canPauseStop: true });
+          setStatus(`Playing: ${track.replaceAll('_',' ').replaceAll('-',' ')}`);
+        } catch (e) {
+          setButtons({ canPlay: true, canPauseStop: false });
+          setStatus(`Play failed: ${e.message}`);
+          alert(`Play failed: ${e.message}`);
+        }
+      }
+
+      async function pause() {
+        try {
+          await postNoBody('/pause');
+          // keep play enabled so user can "resume" by pressing Play again
+          setButtons({ canPlay: true, canPauseStop: true });
+          setStatus('Paused.');
+        } catch (e) {
+          setStatus(`Pause failed: ${e.message}`);
+          alert(`Pause failed: ${e.message}`);
+        }
+      }
+
+      async function stop() {
+        try {
+          await postNoBody('/stop');
+          const sel = document.getElementById('nowSelect');
+          if (sel) sel.value = "";
+          setButtons({ canPlay: false, canPauseStop: false });
+          document.getElementById('timerStatus').textContent = '';
+          setStatus('Stopped.');
+        } catch (e) {
+          setStatus(`Stop failed: ${e.message}`);
+          alert(`Stop failed: ${e.message}`);
+        }
+      }
+
+      function initTrackSelect() {
+        const sel = document.getElementById('nowSelect');
+        if (!sel) return;
+
+        // start with no selection
+        sel.value = "";
+        setButtons({ canPlay: false, canPauseStop: false });
+
+        sel.addEventListener('change', () => {
+          const track = sel.value;
+          // enable Play when a track is selected
+          setButtons({ canPlay: !!track, canPauseStop: false });
+          if (track) {
+            // autoplay on select (your previous behavior)
+            play(track);
+          } else {
+            setStatus('');
+          }
+        });
+      }
+
+      // =========================
+      // Volume slider
+      // =========================
+      function snapEven(n) {
+        n = Math.round(Number(n) || 0);
+        return Math.max(0, Math.min(100, n - (n % 2)));
+      }
+
+      function setVolumeLabel(v) {
+        document.getElementById('volumeLabel').textContent = `${v}%`;
+      }
+
+      async function commitVolume(v) {
+        try {
+          await postJson('/volume', { value: v / 100.0 });
+        } catch (e) {
+          console.warn('Volume update failed:', e.message);
+          setStatus(`Volume failed: ${e.message}`);
+        }
+      }
+
+      function initVolume() {
+        const slider = document.getElementById('volumeSlider');
+        if (!slider) return;
+
+        // label init
+        let v = snapEven(slider.value);
+        slider.value = v;
+        setVolumeLabel(v);
+
+        // live update while dragging
+        slider.addEventListener('input', () => {
+          const v = snapEven(slider.value);
+          slider.value = v;
+          setVolumeLabel(v);
+        });
+
+        // commit on release
+        slider.addEventListener('change', async () => {
+          const v = snapEven(slider.value);
+          slider.value = v;
+          setVolumeLabel(v);
+          await commitVolume(v);
+        });
+      }
+
+      // =========================
+      // Sleep timer presets
+      // =========================
+      function initTimer() {
+        const sel = document.getElementById('timerSelect');
+        if (!sel) return;
+
+        sel.value = "0";
+        document.getElementById('timerStatus').textContent = '';
+
+        sel.addEventListener('change', async () => {
+          const minutes = Number(sel.value) || 0;
+
+          if (minutes <= 0) {
+            try {
+              await postJson('/timer', { action: 'cancel' });
+              document.getElementById('timerStatus').textContent = 'Timer off.';
+            } catch (e) {
+              alert(`Cancel failed: ${e.message}`);
+            }
+            return;
+          }
+
+          try {
+            const out = await postJson('/timer', {
+              action: 'start',
+              minutes,
+              fade_out_seconds: FADE_OUT_SECONDS
+            });
+
+            document.getElementById('timerStatus').textContent =
+              out.ends_at_local ? `Ends at ${out.ends_at_local}` : `Timer set for ${minutes} minutes.`;
+          } catch (e) {
+            alert(`Timer failed: ${e.message}`);
+          }
+        });
+      }
+
+      // =========================
+      // Init
+      // =========================
+      window.addEventListener('DOMContentLoaded', () => {
+        initBackground();
+        initTrackSelect();
+        initVolume();
+        initTimer();
+        setStatus('');
+      });
+    </script>
+
+  </div>
+
+</body>
+</html>
