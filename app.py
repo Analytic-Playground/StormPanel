@@ -1,8 +1,21 @@
+# app.py
+# Drop-in stable control panel server for WhiteNoise Pi
+#
+# Key improvements vs your current version:
+# - All endpoints return JSON (no HTML 500 pages injected into your UI)
+# - Track selection is an immediate cutover: hard_stop -> load -> start (no waiting)
+# - Pause is a toggle-safe endpoint (pause/resume depending on state)
+# - /status reflects the engine’s stable get_state() schema (and stays backward-friendly)
+# - Timer + motion endpoints are implemented safely (work even if engine lacks methods)
+
+from __future__ import annotations
+
 from flask import Flask, render_template, jsonify, request, redirect, url_for, flash
 from wifi_api import bp as wifi_api_bp
 import subprocess
 import os
 from pathlib import Path
+from typing import Any
 
 from audio_engine import get_engine
 
@@ -20,8 +33,14 @@ LAST_TRACK: str | None = None
 
 
 # ==============================
-# Track Helpers
+# Helpers
 # ==============================
+
+def json_error(msg: str, status: int = 400, **extra: Any):
+    payload = {"ok": False, "error": msg}
+    payload.update(extra)
+    return jsonify(payload), status
+
 
 def list_tracks() -> list[str]:
     if not AUDIO_DIR.exists():
@@ -73,7 +92,7 @@ def scan_wifi() -> list[dict]:
             signal_i = 0
         nets.append({"ssid": ssid, "signal": signal_i, "security": security or ""})
 
-    best = {}
+    best: dict[str, dict] = {}
     for n in nets:
         s = n["ssid"]
         if (s not in best) or (n["signal"] > best[s]["signal"]):
@@ -82,104 +101,217 @@ def scan_wifi() -> list[dict]:
     return sorted(best.values(), key=lambda x: x["signal"], reverse=True)
 
 
+def engine_state() -> dict:
+    """
+    Normalize engine.get_state() into a safe dict even if the engine changes.
+    """
+    try:
+        st = ENGINE.get_state()
+        if isinstance(st, dict):
+            return st
+    except Exception:
+        app.logger.exception("ENGINE.get_state failed")
+    return {"status": "error", "track": None, "volume": None, "paused": False, "playing": False, "error": "get_state failed"}
+
+
 # ==============================
 # Routes
 # ==============================
 
-@app.route("/")
+@app.get("/")
 def index():
-    # You’re hardcoding track names in index.html now; this is harmless to keep.
+    # index.html may hardcode track names; keep list_tracks for flexibility.
     return render_template("index.html", tracks=list_tracks(), selected_track=None)
 
 
-@app.route("/play", methods=["POST"])
+@app.post("/play")
 def play():
+    """
+    IMPORTANT: This endpoint performs an immediate cutover for stability:
+      hard_stop -> load -> start
+    No fade-out waits or polling. This eliminates multi-second "dead air" delays
+    caused by application-side waiting.
+    """
     global LAST_TRACK
 
     data = request.get_json(silent=True) or {}
-    track = data.get("track")
-    fade_in = float(data.get("fade_in_seconds", 5))
+    track = (data.get("track") or "").strip()
+
+    # Default to a short fade-in; long fades can feel like "nothing is happening"
+    fade_in = float(data.get("fade_in_seconds", 0.25))
 
     try:
         p = resolve_track_filename(track)
         if not p.exists():
-            return f"track not found: {p.name}", 404
+            return json_error(f"track not found: {p.name}", 404)
 
+        # Instant transition
+        ENGINE.hard_stop()
         ENGINE.load_wav(str(p))
         ENGINE.start(fade_in_seconds=fade_in)
+
         LAST_TRACK = p.name
 
-        return jsonify({"ok": True, "status": "playing", "track": p.name})
+        st = engine_state()
+        return jsonify({"ok": True, **st, "last_track": LAST_TRACK})
 
     except ValueError as e:
-        return f"play error: {e}", 400
+        return json_error(f"play error: {e}", 400)
     except Exception as e:
         app.logger.exception("Play failed")
-        return f"play error: {type(e).__name__}: {e}", 500
+        return json_error(f"play error: {type(e).__name__}: {e}", 500)
 
 
-@app.route("/pause", methods=["POST"])
+@app.post("/pause")
 def pause():
-    ENGINE.pause()
-    return jsonify({"ok": True, "status": "paused"})
+    """
+    Toggle pause for better UX. If playing -> pause. If paused -> resume.
+    """
+    try:
+        st = engine_state()
+        if st.get("playing") and not st.get("paused"):
+            # Prefer toggle_pause if available
+            if hasattr(ENGINE, "toggle_pause"):
+                ENGINE.toggle_pause()
+            else:
+                ENGINE.pause()
+        elif st.get("playing") and st.get("paused"):
+            if hasattr(ENGINE, "toggle_pause"):
+                ENGINE.toggle_pause()
+            else:
+                ENGINE.resume()
+
+        return jsonify({"ok": True, **engine_state(), "last_track": LAST_TRACK})
+    except Exception as e:
+        app.logger.exception("Pause failed")
+        return json_error(f"pause error: {type(e).__name__}: {e}", 500)
 
 
-@app.route("/stop", methods=["POST"])
+@app.post("/stop")
 def stop():
-    ENGINE.hard_stop()
-    return jsonify({"ok": True, "status": "stopped"})
+    try:
+        ENGINE.hard_stop()
+        return jsonify({"ok": True, **engine_state(), "last_track": LAST_TRACK})
+    except Exception as e:
+        app.logger.exception("Stop failed")
+        return json_error(f"stop error: {type(e).__name__}: {e}", 500)
 
 
-@app.route("/timer", methods=["POST"])
-def timer():
-    data = request.get_json(silent=True) or {}
-    action = (data.get("action") or "start").lower().strip()
-
-    if action == "cancel":
-        ENGINE.cancel_timer()
-        return jsonify({"ok": True, "status": "timer_canceled"})
-
-    minutes = int(data.get("minutes") or 0)
-    if minutes <= 0:
-        return jsonify({"error": "No timer duration provided"}), 400
-
-    fade_out_seconds = float(data.get("fade_out_seconds", 90))
-    seconds = minutes * 60
-
-    ENGINE.play_for(seconds=seconds, fade_out_seconds=fade_out_seconds)
-    return jsonify({"ok": True, "status": "timer_set", "minutes": minutes})
-
-
-@app.route("/status")
+@app.get("/status")
 def status():
-    st = ENGINE.get_state()
+    """
+    Backward-friendly status:
+    - New clients can read 'status/playing/paused/track/volume/error'
+    - Old clients can read 'is_playing/is_paused'
+    """
+    st = engine_state()
     return jsonify({
         "ok": True,
-        "is_playing": bool(st.get("is_playing")),
-        "is_paused": bool(st.get("is_paused")),
-        "fade_state": st.get("fade_state"),
-        "has_stream": bool(st.get("has_stream")),
+        "status": st.get("status"),
+        "track": st.get("track") or LAST_TRACK,
+        "volume": st.get("volume"),
+        "playing": bool(st.get("playing")),
+        "paused": bool(st.get("paused")),
+        "error": st.get("error"),
         "last_track": LAST_TRACK,
-        "sr": st.get("sr"),
+        # legacy keys:
+        "is_playing": bool(st.get("playing")),
+        "is_paused": bool(st.get("paused")),
     })
 
 
-@app.route("/volume", methods=["POST"])
+@app.post("/volume")
 def volume():
-    data = request.get_json(silent=True) or {}
-    value = float(data.get("value", 0.7))
-    ENGINE.set_volume(value)
-    return jsonify({"ok": True, "volume": value})
+    """
+    Accepts {value: 0.0-1.0} or {value: 0-100}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        if "value" not in data:
+            return json_error("Missing 'value' for volume", 400)
+
+        value = float(data.get("value"))
+        ENGINE.set_volume(value)
+
+        st = engine_state()
+        return jsonify({"ok": True, "volume": st.get("volume"), **st})
+    except ValueError:
+        return json_error("Volume must be a number", 400)
+    except Exception as e:
+        app.logger.exception("Volume failed")
+        return json_error(f"volume error: {type(e).__name__}: {e}", 500)
 
 
-@app.route("/motion", methods=["POST"])
+@app.post("/motion")
 def motion():
-    # Optional: wire this later from UI. For now keep endpoint compatible.
-    data = request.get_json(silent=True) or {}
-    depth = float(data.get("depth", ENGINE.cfg.drift_depth))
-    period_s = float(data.get("period_s", ENGINE.cfg.drift_period_s))
-    ENGINE.set_motion(depth=depth, period_s=period_s)
-    return jsonify({"ok": True, "depth": ENGINE.cfg.drift_depth, "period_s": ENGINE.cfg.drift_period_s})
+    """
+    Optional: compatible endpoint. If your engine supports set_motion, call it.
+    Otherwise, set cfg directly if present.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        depth = data.get("depth", None)
+        period_s = data.get("period_s", None)
+
+        if depth is None and period_s is None:
+            # no-op but OK
+            return jsonify({"ok": True, **engine_state()})
+
+        # Prefer engine method if present
+        if hasattr(ENGINE, "set_motion"):
+            kwargs = {}
+            if depth is not None:
+                kwargs["depth"] = float(depth)
+            if period_s is not None:
+                kwargs["period_s"] = float(period_s)
+            ENGINE.set_motion(**kwargs)
+        else:
+            # Fallback: set cfg fields directly if available
+            if depth is not None and hasattr(ENGINE, "cfg"):
+                ENGINE.cfg.drift_depth = float(depth)
+            if period_s is not None and hasattr(ENGINE, "cfg"):
+                ENGINE.cfg.drift_period_s = float(period_s)
+
+        return jsonify({"ok": True, **engine_state()})
+    except Exception as e:
+        app.logger.exception("Motion failed")
+        return json_error(f"motion error: {type(e).__name__}: {e}", 500)
+
+
+@app.post("/timer")
+def timer():
+    """
+    Safe timer endpoint:
+    If your engine implements play_for/cancel_timer, we use it.
+    Otherwise we return a clear JSON error instead of crashing.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        action = (data.get("action") or "start").lower().strip()
+
+        if action == "cancel":
+            if hasattr(ENGINE, "cancel_timer"):
+                ENGINE.cancel_timer()
+                return jsonify({"ok": True, "status": "timer_canceled", **engine_state()})
+            return json_error("Timer cancel not supported by current audio engine", 400)
+
+        minutes = int(data.get("minutes") or 0)
+        if minutes <= 0:
+            return json_error("No timer duration provided", 400)
+
+        fade_out_seconds = float(data.get("fade_out_seconds", 90))
+        seconds = minutes * 60
+
+        if hasattr(ENGINE, "play_for"):
+            ENGINE.play_for(seconds=seconds, fade_out_seconds=fade_out_seconds)
+            return jsonify({"ok": True, "status": "timer_set", "minutes": minutes, **engine_state()})
+
+        return json_error("Timer not supported by current audio engine", 400)
+
+    except Exception as e:
+        app.logger.exception("Timer failed")
+        return json_error(f"timer error: {type(e).__name__}: {e}", 500)
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -226,5 +358,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8080,
         debug=is_dev,
-        use_reloader=is_dev
+        use_reloader=is_dev,
     )
