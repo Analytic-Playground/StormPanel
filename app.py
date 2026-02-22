@@ -2,11 +2,9 @@ from flask import Flask, render_template, jsonify, request, redirect, url_for, f
 from wifi_api import bp as wifi_api_bp
 import subprocess
 import os
-import signal
-import threading
-import time
 from pathlib import Path
 
+from audio_engine import get_engine
 
 app = Flask(__name__)
 app.register_blueprint(wifi_api_bp)
@@ -16,13 +14,9 @@ BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "audio"
 AUDIO_EXTS = {".wav"}
 
-LAST_TRACK: str | None = None
+ENGINE = get_engine(force_new=True)
 
-# --- process-based audio state ---
-AUDIO_LOCK = threading.Lock()
-AUDIO_PROC: subprocess.Popen | None = None
-TIMER_THREAD: threading.Thread | None = None
-TIMER_CANCEL = threading.Event()
+LAST_TRACK: str | None = None
 
 
 # ==============================
@@ -89,128 +83,12 @@ def scan_wifi() -> list[dict]:
 
 
 # ==============================
-# Audio Process Control
-# ==============================
-
-def _kill_proc(proc: subprocess.Popen):
-    """Best-effort terminate/kill of the audio subprocess."""
-    try:
-        # terminate process group if we started one
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except Exception:
-            proc.terminate()
-    except Exception:
-        pass
-
-    # give it a moment
-    try:
-        proc.wait(timeout=0.8)
-        return
-    except Exception:
-        pass
-
-    # hard kill
-    try:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
-    except Exception:
-        pass
-
-    try:
-        proc.wait(timeout=0.8)
-    except Exception:
-        pass
-
-
-def stop_audio():
-    global AUDIO_PROC
-    with AUDIO_LOCK:
-        if AUDIO_PROC is None:
-            app.logger.warning("[AUDIODBG] stop_audio: no active proc")
-            return
-        proc = AUDIO_PROC
-        AUDIO_PROC = None
-
-    app.logger.warning(f"[AUDIODBG] stop_audio: terminating pid={proc.pid}")
-    _kill_proc(proc)
-    app.logger.warning(f"[AUDIODBG] stop_audio: terminated pid={proc.pid} rc={proc.returncode}")
-
-
-def start_audio_wav(path: Path):
-    """
-    Start WAV playback via aplay as a separate process (non-blocking).
-    Logs stderr/stdout and exit codes so we can debug ALSA issues.
-    """
-    global AUDIO_PROC
-
-    app.logger.warning(f"[AUDIODBG] start_audio_wav requested path={path}")
-    stop_audio()
-
-    proc = subprocess.Popen(
-        ["aplay", str(path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-
-    with AUDIO_LOCK:
-        AUDIO_PROC = proc
-
-    app.logger.warning(f"[AUDIODBG] aplay started pid={proc.pid}")
-
-    def drain_and_log(p: subprocess.Popen):
-        try:
-            out, err = p.communicate()
-        except Exception as e:
-            app.logger.error(f"[AUDIODBG] aplay communicate failed: {e}")
-            return
-
-        # Keep logs readable (last 800 chars)
-        out_tail = (out or "")[-800:]
-        err_tail = (err or "")[-800:]
-
-        app.logger.warning(
-            f"[AUDIODBG] aplay exited pid={p.pid} rc={p.returncode} "
-            f"stdout_tail={out_tail!r} stderr_tail={err_tail!r}"
-        )
-
-    threading.Thread(target=drain_and_log, args=(proc,), daemon=True).start()
-
-
-def is_playing() -> bool:
-    with AUDIO_LOCK:
-        proc = AUDIO_PROC
-    if proc is None:
-        return False
-    return proc.poll() is None
-
-
-def cancel_timer():
-    TIMER_CANCEL.set()
-
-
-def _timer_worker(seconds: int):
-    TIMER_CANCEL.clear()
-    start = time.time()
-    while True:
-        if TIMER_CANCEL.is_set():
-            return
-        if time.time() - start >= seconds:
-            break
-        time.sleep(0.25)
-    stop_audio()
-
-
-# ==============================
 # Routes
 # ==============================
 
 @app.route("/")
 def index():
+    # You’re hardcoding track names in index.html now; this is harmless to keep.
     return render_template("index.html", tracks=list_tracks(), selected_track=None)
 
 
@@ -220,16 +98,15 @@ def play():
 
     data = request.get_json(silent=True) or {}
     track = data.get("track")
-
-    # fade_in_seconds accepted but not used with aplay (kept for API compatibility)
-    # fade_in = float(data.get("fade_in_seconds", 10))
+    fade_in = float(data.get("fade_in_seconds", 5))
 
     try:
         p = resolve_track_filename(track)
         if not p.exists():
             return f"track not found: {p.name}", 404
 
-        start_audio_wav(p)
+        ENGINE.load_wav(str(p))
+        ENGINE.start(fade_in_seconds=fade_in)
         LAST_TRACK = p.name
 
         return jsonify({"ok": True, "status": "playing", "track": p.name})
@@ -243,61 +120,66 @@ def play():
 
 @app.route("/pause", methods=["POST"])
 def pause():
-    # Treat pause as stop (reliable + matches your current UI behavior)
-    stop_audio()
+    ENGINE.pause()
     return jsonify({"ok": True, "status": "paused"})
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    stop_audio()
+    ENGINE.hard_stop()
     return jsonify({"ok": True, "status": "stopped"})
 
 
 @app.route("/timer", methods=["POST"])
 def timer():
-    global TIMER_THREAD
-
     data = request.get_json(silent=True) or {}
     action = (data.get("action") or "start").lower().strip()
 
     if action == "cancel":
-        cancel_timer()
+        ENGINE.cancel_timer()
         return jsonify({"ok": True, "status": "timer_canceled"})
 
     minutes = int(data.get("minutes") or 0)
     if minutes <= 0:
         return jsonify({"error": "No timer duration provided"}), 400
 
+    fade_out_seconds = float(data.get("fade_out_seconds", 90))
     seconds = minutes * 60
 
-    # (Re)start timer thread
-    cancel_timer()
-    TIMER_THREAD = threading.Thread(target=_timer_worker, args=(seconds,), daemon=True)
-    TIMER_THREAD.start()
-
+    ENGINE.play_for(seconds=seconds, fade_out_seconds=fade_out_seconds)
     return jsonify({"ok": True, "status": "timer_set", "minutes": minutes})
 
 
 @app.route("/status")
 def status():
+    st = ENGINE.get_state()
     return jsonify({
         "ok": True,
-        "is_playing": is_playing(),
+        "is_playing": bool(st.get("is_playing")),
+        "is_paused": bool(st.get("is_paused")),
+        "fade_state": st.get("fade_state"),
+        "has_stream": bool(st.get("has_stream")),
         "last_track": LAST_TRACK,
+        "sr": st.get("sr"),
     })
 
 
 @app.route("/volume", methods=["POST"])
 def volume():
-    # Not supported in this aplay-backed mode (easy to add via amixer later)
-    return jsonify({"ok": False, "error": "volume control not supported in aplay mode"}), 400
+    data = request.get_json(silent=True) or {}
+    value = float(data.get("value", 0.7))
+    ENGINE.set_volume(value)
+    return jsonify({"ok": True, "volume": value})
 
 
 @app.route("/motion", methods=["POST"])
 def motion():
-    # Not supported in this aplay-backed mode
-    return jsonify({"ok": False, "error": "motion control not supported in aplay mode"}), 400
+    # Optional: wire this later from UI. For now keep endpoint compatible.
+    data = request.get_json(silent=True) or {}
+    depth = float(data.get("depth", ENGINE.cfg.drift_depth))
+    period_s = float(data.get("period_s", ENGINE.cfg.drift_period_s))
+    ENGINE.set_motion(depth=depth, period_s=period_s)
+    return jsonify({"ok": True, "depth": ENGINE.cfg.drift_depth, "period_s": ENGINE.cfg.drift_period_s})
 
 
 @app.route("/setup", methods=["GET", "POST"])

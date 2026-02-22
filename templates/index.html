@@ -20,6 +20,7 @@
         <option value="storm-1080.mp4">🌩 Storm</option>
         <option value="ocean-1080-loop.mp4">🌊 Ocean</option>
         <option value="fog_1080p_30fps.mp4">🌫 Fog</option>
+	<option value="snow-720p-optimized.mp4">❄️ Snow</option>
         <option value="forest_1080p_24fps.mp4">🌲 Forest</option>
       </select>
     </div>
@@ -30,10 +31,13 @@
       <h3>Now Playing</h3>
 
       <select id="nowSelect" class="control-select">
-        <option value="" selected>Select a track…</option>
-        {% for track in tracks %}
-          <option value="{{ track }}">{{ track.replace('_',' ').replace('-',' ') }}</option>
-        {% endfor %}
+  	<option value="" selected>Select a track…</option>
+
+  	<option value="rain_ocean_master.wav">🌊 Rain + Ocean (Master)</option>
+  	<option value="rainforest-distant-thunder.wav">🌿 Rainforest (Distant Thunder)</option>
+
+  	<!-- add more masters here -->
+  	<!-- <option value="thunder_mountains_master.wav">⛰️ Thunder in the Mountains (Master)</option> -->
       </select>
 
       <div style="display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
@@ -59,7 +63,7 @@
         type="range"
         min="0"
         max="100"
-        step="2"
+        step="5"
         value="70"
       >
     </div>
@@ -84,7 +88,7 @@
       // =========================
       // Config
       // =========================
-      const FADE_IN_SECONDS = 10;
+      const FADE_IN_SECONDS = 5;
       const FADE_OUT_SECONDS = 90;
       const DEFAULT_BG = 'storm-1080.mp4';
 
