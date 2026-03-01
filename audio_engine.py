@@ -4,7 +4,7 @@
 # - Keeps ONE OutputStream alive (prevents multi-second start delays on some devices)
 # - Never raises out of the audio callback (prevents "plays once then dead")
 # - Supports: load_wav, start, stop (fade), hard_stop, pause/resume/toggle_pause,
-#            set_volume (0-1 or 0-100), get_state
+#            set_volume (0-1 or 0-100), get_state, play_for, cancel_timer
 #
 # Drop-in compatible with your Flask control panel.
 
@@ -24,8 +24,8 @@ class MotionConfig:
     volume: float = 0.65          # 0.0-1.0
     drift_depth: float = 0.05     # 0.0 disables
     drift_period_s: float = 80.0
-    fade_in_s: float = 0.25       # short by default to avoid "silent start"
-    fade_out_s: float = 0.25      # short by default for snappy track switching
+    fade_in_s: float = 120.0      # 2 minutes fade in
+    fade_out_s: float = 360.0     # 6 minutes fade out
 
 
 class AudioEngine:
@@ -56,6 +56,9 @@ class AudioEngine:
         self.current_track: Optional[str] = None
         self.status: str = "stopped"  # "playing" | "paused" | "stopped" | "error"
         self.last_error: Optional[str] = None
+
+        # Sleep timer
+        self._timer_cancel: Optional[threading.Event] = None
 
     # ------------------------
     # Public API
@@ -171,6 +174,37 @@ class AudioEngine:
             else:
                 self._is_paused = True
                 self.status = "paused"
+
+    def play_for(self, seconds: float, fade_out_seconds: float = 360.0):
+        """
+        Play for a set duration, then fade out and stop.
+        Cancels any existing timer before starting a new one.
+        """
+        self.cancel_timer()
+
+        fade = max(0.0, float(fade_out_seconds))
+        wait = max(0.0, float(seconds) - fade)
+
+        self._timer_cancel = threading.Event()
+        cancel_event = self._timer_cancel
+
+        def _run():
+            if cancel_event.wait(timeout=wait):
+                return  # canceled
+            if not cancel_event.is_set():
+                self.stop(fade_out_seconds=fade)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+    def cancel_timer(self):
+        """
+        Cancel any running sleep timer.
+        """
+        event = getattr(self, "_timer_cancel", None)
+        if event is not None:
+            event.set()
+        self._timer_cancel = None
 
     def close(self):
         """
